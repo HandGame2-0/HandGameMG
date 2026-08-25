@@ -1,0 +1,15 @@
+{
+    "boss_max_hp": 100,
+    "player_max_hp": 100,
+    "damage_per_hit": 10,
+    "points_per_hit": 100,
+    "player_damage_per_miss": 10,
+
+    "match_time_seconds": 60.0,
+    "gesture_time_limit_seconds": 7.0,
+    "gesture_image_reveal_percentage": 50.0,
+
+    "time_penalty_seconds": 1.0,
+    "score_penalty_points": 50,
+    "boss_strengthen_hp": 5
+}
