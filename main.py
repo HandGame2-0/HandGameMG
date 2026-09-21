@@ -4,19 +4,17 @@ import sys
 
 from PySide6.QtWidgets import QApplication
 
-from boss_fight.boss_fight import BossFight
+from dev_harness import BossFightHarness
 
 
 def main() -> None:
     app = QApplication(sys.argv)
 
-    bossfight = BossFight()
-    bossfight.setWindowTitle("Boss Fight")
-    bossfight.resize(640, 560)
-    bossfight.game_won.connect(lambda: print("You won!"))
-    bossfight.game_lost.connect(lambda: print("You lost!"))
-    bossfight.show()
-    bossfight.start()
+    harness = BossFightHarness()
+    harness.setWindowTitle("Boss Fight (dev harness)")
+    harness.resize(640, 560)
+    harness.show()
+    harness.start()
 
     sys.exit(app.exec())
 

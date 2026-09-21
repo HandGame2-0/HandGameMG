@@ -1,0 +1,48 @@
+[project]
+name = "handgamemg"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["PySide6"]
+
+[project.optional-dependencies]
+dev = ["pytest", "black", "ruff", "mypy"]
+
+[tool.setuptools]
+py-modules = ["main", "dev_harness"]
+
+[tool.setuptools.packages.find]
+include = ["boss_fight*", "game_framework*", "minigames_shared_API*"]
+
+[tool.black]
+line-length = 100
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N"]
+
+[tool.ruff.lint.per-file-ignores]
+# Qt requires overriding camelCase event handlers (resizeEvent, keyPressEvent, ...).
+"boss_fight/boss_fight_view.py" = ["N802"]
+"dev_harness.py" = ["N802"]
+# Pre-existing package name (predates this contract, not renamed to avoid churn
+# across every import site).
+"minigames_shared_API/__init__.py" = ["N999"]
+
+[tool.mypy]
+python_version = "3.11"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+# PySide6's bundled stubs don't resolve Qt.* / QSizePolicy.* enum members or
+# QLayout's Optional return type precisely enough under strict mypy; the
+# priority is that game_framework/ and boss_fight_game.py (zero Qt imports)
+# type-check cleanly, not these Qt-boilerplate-only view/harness modules.
+module = ["boss_fight.boss_fight_view", "dev_harness"]
+disallow_untyped_defs = false
+disable_error_code = ["attr-defined", "union-attr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
