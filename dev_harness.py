@@ -44,6 +44,7 @@ class BossFightHarness(QWidget):
         self._session_id = ""
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self._view)
 
         self._timer = QTimer(self)
