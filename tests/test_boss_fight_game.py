@@ -50,17 +50,15 @@ class RecordingSink:
 
 def make_config(**overrides: Any) -> BossFightConfig:
     defaults = dict(
-        boss_max_hp=20,
-        player_max_hp=20,
-        damage_per_hit=10,
+        charge_max=20,
+        charge_per_hit=10,
         points_per_hit=100,
-        player_damage_per_miss=10,
+        charge_loss_per_miss=5,
         match_time_seconds=100.0,
         gesture_time_limit_seconds=5.0,
         gesture_image_reveal_percentage=50.0,
         time_penalty_seconds=1.0,
         score_penalty_points=50,
-        boss_strengthen_hp=5,
     )
     defaults.update(overrides)
     return BossFightConfig(**defaults)
@@ -104,6 +102,18 @@ def send_hit(game: BossFightGame, context: GameContext) -> None:
     )
 
 
+def send_sign(game: BossFightGame, context: GameContext, sign: str) -> None:
+    game.handle_gesture(
+        GestureRecognitionEvent(
+            session_id=context.session_id,
+            player_id=_PLAYER_ID,
+            camera_id=_CAMERA_ID,
+            recognized_sign=sign,
+            confidence=1.0,
+        )
+    )
+
+
 def force_gesture_timeout(game: BossFightGame, config: BossFightConfig) -> None:
     game.update_frame(config.gesture_time_limit_seconds * 1000 + 1)
 
@@ -116,7 +126,7 @@ def test_start_transitions_to_running_and_sets_first_target() -> None:
     assert GameState.RUNNING in sink.states
 
 
-def test_hit_reduces_boss_hp_increases_score_and_advances_target() -> None:
+def test_hit_fills_charge_increases_score_and_advances_target() -> None:
     config = make_config()
     game, sink, context = make_game(config)
 
@@ -124,7 +134,7 @@ def test_hit_reduces_boss_hp_increases_score_and_advances_target() -> None:
 
     runtime = game.get_runtime_state()
     player = game.get_player_state(_PLAYER_ID)
-    assert runtime.boss_hp == config.boss_max_hp - config.damage_per_hit
+    assert runtime.charge == config.charge_per_hit
     assert player.score == config.points_per_hit
     assert player.current_step == 1
     assert runtime.current_target_letter == "B"
@@ -132,8 +142,8 @@ def test_hit_reduces_boss_hp_increases_score_and_advances_target() -> None:
     assert sink.actions[-1].is_success is True
 
 
-def test_boss_hp_zero_finalizes_as_completed_win() -> None:
-    config = make_config(boss_max_hp=20, damage_per_hit=10)
+def test_full_charge_finalizes_as_completed_win() -> None:
+    config = make_config(charge_max=20, charge_per_hit=10)
     game, sink, context = make_game(config)
 
     send_hit(game, context)
@@ -146,38 +156,45 @@ def test_boss_hp_zero_finalizes_as_completed_win() -> None:
     assert result.metadata["outcome"] == "win"
 
 
-def test_miss_via_gesture_timeout_strengthens_boss_hp_only() -> None:
-    config = make_config()
-    game, sink, _ = make_game(config)
+def test_wrong_letter_drains_charge_and_keeps_target() -> None:
+    config = make_config(charge_max=100, charge_per_hit=10, charge_loss_per_miss=4)
+    game, sink, context = make_game(config)
+    send_hit(game, context)  # charge 10, target now "B"
+
+    send_sign(game, context, "Z")
+
+    runtime = game.get_runtime_state()
+    assert runtime.charge == 6
+    assert runtime.current_target_letter == "B"
+    assert game.get_player_state(_PLAYER_ID).mistakes == 1
+    assert sink.actions[-1].action_type == "wrong"
+
+
+def test_wrong_letter_charge_floors_at_zero() -> None:
+    game, _, context = make_game()
+
+    send_sign(game, context, "Z")
+
+    assert game.get_runtime_state().charge == 0
+
+
+def test_miss_via_gesture_timeout_drains_charge_and_penalizes() -> None:
+    config = make_config(charge_max=100, charge_per_hit=10, charge_loss_per_miss=4)
+    game, sink, context = make_game(config)
+    send_hit(game, context)  # charge 10, score 100
 
     force_gesture_timeout(game, config)
 
     runtime = game.get_runtime_state()
     player = game.get_player_state(_PLAYER_ID)
     assert player.mistakes == 1
-    assert player.score == 0  # floored at 0, penalty was 50
-    assert runtime.player_hp == config.player_max_hp - config.player_damage_per_miss
+    assert player.score == 50
+    assert runtime.charge == 6
+    assert runtime.current_target_letter == "C"
     dt = (config.gesture_time_limit_seconds * 1000 + 1) / 1000.0
     expected_time_remaining = config.match_time_seconds - dt - config.time_penalty_seconds
     assert runtime.time_remaining == pytest.approx(expected_time_remaining)
-    assert runtime.boss_hp == min(
-        config.boss_max_hp, config.boss_max_hp + config.boss_strengthen_hp
-    )
-    assert runtime.boss_max_hp == config.boss_max_hp  # unchanged — the confirmed bug fix
     assert sink.actions[-1].action_type == "miss"
-
-
-def test_player_hp_zero_finalizes_as_completed_loss() -> None:
-    config = make_config(player_max_hp=10, player_damage_per_miss=10)
-    game, sink, _ = make_game(config)
-
-    force_gesture_timeout(game, config)
-
-    assert game.get_state() == GameState.FINISHED
-    result = sink.results[0]
-    assert result.end_reason == GameEndReason.COMPLETED
-    assert result.metadata["outcome"] == "loss"
-    assert result.player_results[_PLAYER_ID].is_active is False
 
 
 def test_match_timeout_finalizes_with_timeout_reason() -> None:
@@ -189,11 +206,12 @@ def test_match_timeout_finalizes_with_timeout_reason() -> None:
     assert game.get_state() == GameState.FINISHED
     result = sink.results[0]
     assert result.end_reason == GameEndReason.TIMEOUT
+    assert result.metadata["outcome"] == "timeout"
 
 
 def test_handle_gesture_rejects_wrong_session_id() -> None:
     game, sink, _ = make_game()
-    boss_hp_before = game.get_runtime_state().boss_hp
+    charge_before = game.get_runtime_state().charge
 
     game.handle_gesture(
         GestureRecognitionEvent(
@@ -205,7 +223,7 @@ def test_handle_gesture_rejects_wrong_session_id() -> None:
         )
     )
 
-    assert game.get_runtime_state().boss_hp == boss_hp_before
+    assert game.get_runtime_state().charge == charge_before
     assert len(sink.errors) == 1
     assert sink.errors[0][1] is True  # recoverable
 
@@ -265,7 +283,7 @@ def test_reset_from_running_returns_to_created_and_allows_restart() -> None:
 
 
 def test_reset_from_finished_returns_to_created() -> None:
-    config = make_config(boss_max_hp=10, damage_per_hit=10)
+    config = make_config(charge_max=10, charge_per_hit=10)
     game, sink, context = make_game(config)
     send_hit(game, context)
     assert game.get_state() == GameState.FINISHED
@@ -276,7 +294,7 @@ def test_reset_from_finished_returns_to_created() -> None:
 
 
 def test_end_called_twice_is_idempotent() -> None:
-    config = make_config(boss_max_hp=10, damage_per_hit=10)
+    config = make_config(charge_max=10, charge_per_hit=10)
     game, sink, context = make_game(config)
     send_hit(game, context)
 
