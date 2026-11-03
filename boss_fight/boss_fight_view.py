@@ -3,11 +3,10 @@
 Reads `BossFightConfig` / `BossFightRuntimeState` / `PlayerGameState` snapshots
 handed to it by whoever drives the game (see `dev_harness.py`) and paints them.
 
-Visual concept: a retro handheld-RPG battle screen. A green-field battlefield
-holds the boss's HP window (top-left) and sprite-on-a-platform (top-right),
-diagonally mirrored by the player's HP window (bottom-right) — the classic
-Game Boy-era crisscross. Below it, a white dialogue box plays the role of the
-message/command box: the letter to sign, its gesture flashcard, and a
+Visual concept: a retro handheld-RPG battle screen. The top 2/3 paints a
+layered scene (starfield, astronaut, alien boss) with score and match time in
+its top corners and the communication bar along its bottom edge. The bottom
+1/3 is a white message box: the letter to sign, its gesture flashcard, and a
 countdown.
 """
 
@@ -15,14 +14,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QSizePolicy,
     QStackedLayout,
     QVBoxLayout,
     QWidget,
@@ -35,36 +34,37 @@ from .config import BossFightConfig
 from .state import BossFightRuntimeState
 
 _ASSETS_DIR = Path(__file__).parent / "assets"
-_BOSS_SPRITE_PATH = _ASSETS_DIR / "boss.png"
-_PLAYER_SPRITE_PATH = _ASSETS_DIR / "player.png"
-_BOSS_SPRITE_HEIGHT = 220
-_PLAYER_SPRITE_HEIGHT = 150
-_BOSS_PLATFORM_WIDTH = 260
-_PLAYER_PLATFORM_WIDTH = 220
-_PLATFORM_HEIGHT = 26
+# Full-canvas layers of one scene, drawn bottom -> top.
+_SCENE_LAYER_PATHS = tuple(
+    _ASSETS_DIR / name for name in ("bg-war.png", "player-war.png", "boss-war.png")
+)
+# The source art is 3508 px wide; composite it once and keep it at this width.
+_SCENE_MAX_WIDTH = 1920
 _GESTURE_IMAGE_WIDTH = 100
 _GESTURE_IMAGE_HEIGHT = 140
-_HP_BAR_HEIGHT = 14
+_CHARGE_BAR_HEIGHT = 14
 
 _TARGET_LETTER_PIXEL_SIZE = 72
 _NAME_PIXEL_SIZE = 15
-_HP_TAG_PIXEL_SIZE = 12
-_HP_VALUE_PIXEL_SIZE = 12
+_CHARGE_VALUE_PIXEL_SIZE = 12
 _INSTRUCTION_PIXEL_SIZE = 16
 _FOOTER_PIXEL_SIZE = 15
 _HINT_LABEL_PIXEL_SIZE = 16
 _REVEAL_RING_DIAMETER = 36
 _REVEAL_RING_STROKE = 4
 
-# The target letter and the gesture flashcard ("hint box") scale up with the
-# window, using this width as their 1.0x reference point.
+# The target letter and the gesture flashcard ("hint box") scale with the
+# window, using this size as their 1.0x reference point. Height counts too, so
+# they keep fitting in the message box's fixed 1/3 of the window.
 _SCALE_REFERENCE_WIDTH = 720
+_SCALE_REFERENCE_HEIGHT = 760
 _MIN_SCALE = 0.6
 _MAX_SCALE = 2.2
 
 
-def _scale_for_width(width: int) -> float:
-    return min(_MAX_SCALE, max(_MIN_SCALE, width / _SCALE_REFERENCE_WIDTH))
+def _scale_for_size(width: int, height: int) -> float:
+    scale = min(width / _SCALE_REFERENCE_WIDTH, height / _SCALE_REFERENCE_HEIGHT)
+    return min(_MAX_SCALE, max(_MIN_SCALE, scale))
 
 
 # No bundled pixel-font file ships with this repo, so this falls back to a
@@ -72,37 +72,19 @@ def _scale_for_width(width: int) -> float:
 # pitch, even without true 8-bit glyphs.
 _FONT_FAMILIES = ["Press Start 2P", "VT323", "Courier New", "DejaVu Sans Mono", "Liberation Mono"]
 
-_FIELD_SKY = "#BEE7FA"
-_FIELD_GROUND = "#BFE6A8"
-_PLATFORM = "#8FB86B"
 _BOX_BG = "#FFFFFF"
 _BOX_BORDER = "#000000"
 _CHIP_BG = "#F2F2F2"
 _TEXT = "#000000"
-_HP_GREEN = "#78C850"
-_HP_YELLOW = "#F8D030"
-_HP_RED = "#E03030"
-_HP_TRACK = "#303030"
+_CHARGE = "#30C8F0"
+_TRACK = "#303030"
 _ACCENT = "#E8A800"
 
 _STYLE_SHEET = f"""
 BossFightView {{
     background-color: {_BOX_BORDER};
 }}
-QFrame#battlefield {{
-    background: qlineargradient(
-        x1:0, y1:0, x2:0, y2:1,
-        stop:0 {_FIELD_SKY}, stop:0.62 {_FIELD_SKY},
-        stop:0.62 {_FIELD_GROUND}, stop:1 {_FIELD_GROUND}
-    );
-    border: none;
-}}
-QFrame#platform {{
-    background-color: {_PLATFORM};
-    border: none;
-    border-radius: {_PLATFORM_HEIGHT // 2}px;
-}}
-QFrame#hpBox {{
+QFrame#chargeBox {{
     background-color: {_BOX_BG};
     border: 3px solid {_BOX_BORDER};
     border-radius: 8px;
@@ -128,7 +110,7 @@ QFrame#counterChip {{
 QProgressBar#gestureTimerBar {{
     border: 2px solid {_BOX_BORDER};
     border-radius: 4px;
-    background-color: {_HP_TRACK};
+    background-color: {_TRACK};
     min-height: 8px;
     max-height: 8px;
 }}
@@ -136,16 +118,13 @@ QProgressBar#gestureTimerBar::chunk {{
     background-color: {_ACCENT};
     border-radius: 3px;
 }}
-"""
-
-_HP_BAR_STYLE = f"""
-QProgressBar {{
+QProgressBar#chargeBar {{
     border: 2px solid {_BOX_BORDER};
     border-radius: 6px;
-    background-color: {_HP_TRACK};
+    background-color: {_TRACK};
 }}
-QProgressBar::chunk {{
-    background-color: __COLOR__;
+QProgressBar#chargeBar::chunk {{
+    background-color: {_CHARGE};
     border-radius: 4px;
 }}
 """
@@ -164,40 +143,51 @@ def _font(
     return font
 
 
-def _hp_bar_color(current: int, maximum: int) -> str:
-    ratio = current / maximum if maximum > 0 else 0.0
-    if ratio > 0.5:
-        return _HP_GREEN
-    if ratio > 0.2:
-        return _HP_YELLOW
-    return _HP_RED
-
-
-def _style_hp_bar(bar: QProgressBar, current: int, maximum: int) -> None:
-    bar.setStyleSheet(_HP_BAR_STYLE.replace("__COLOR__", _hp_bar_color(current, maximum)))
-
-
-def _key_out_light_background(image: QImage, brightness: int = 195, tolerance: int = 20) -> QImage:
-    """Make near-white/grey pixels transparent — these sprite files bake in a flat
-    canvas background instead of real alpha, which shows as a box on the field."""
-    keyed = image.convertToFormat(QImage.Format_ARGB32)
-    for y in range(keyed.height()):
-        for x in range(keyed.width()):
-            color = keyed.pixelColor(x, y)
-            channels = (color.red(), color.green(), color.blue())
-            if min(channels) > brightness and max(channels) - min(channels) <= tolerance:
-                color.setAlpha(0)
-                keyed.setPixelColor(x, y, color)
-    return keyed
-
-
-def _load_sprite(path: Path, target_height: int) -> QPixmap:
-    """Load a small pixel-art sprite and blow it up crisply (no smoothing blur)."""
-    image = QImage(str(path))
-    if image.isNull():
+def _load_scene() -> QPixmap:
+    """Stack the scene layers into one pixmap, downscaled once up front."""
+    scene = QImage()
+    painter: QPainter | None = None
+    for path in _SCENE_LAYER_PATHS:
+        layer = QImage(str(path))
+        if layer.isNull():
+            continue
+        if painter is None:
+            scene = layer.convertToFormat(QImage.Format_ARGB32_Premultiplied)
+            painter = QPainter(scene)
+        else:
+            painter.drawImage(0, 0, layer)
+    if painter is None:
         return QPixmap()
-    pixmap = QPixmap.fromImage(_key_out_light_background(image))
-    return pixmap.scaledToHeight(target_height, Qt.FastTransformation)
+    painter.end()
+    if scene.width() > _SCENE_MAX_WIDTH:
+        scene = scene.scaledToWidth(_SCENE_MAX_WIDTH, Qt.SmoothTransformation)
+    return QPixmap.fromImage(scene)
+
+
+class _Battlefield(QFrame):
+    """Paints the scene cover-style (fills the rect, keeps aspect, crops overflow)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._scene = _load_scene()
+        self._scaled = QPixmap()
+        self._scaled_for = QSize()
+
+    def paintEvent(self, event) -> None:
+        if self._scene.isNull():
+            return
+        if self._scaled_for != self.size():
+            self._scaled_for = self.size()
+            self._scaled = self._scene.scaled(
+                self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+            )
+        painter = QPainter(self)
+        painter.drawPixmap(
+            (self.width() - self._scaled.width()) // 2,
+            (self.height() - self._scaled.height()) // 2,
+            self._scaled,
+        )
+        painter.end()
 
 
 class _CountdownRing(QWidget):
@@ -220,7 +210,7 @@ class _CountdownRing(QWidget):
         inset = _REVEAL_RING_STROKE // 2
         rect = self.rect().adjusted(inset, inset, -inset, -inset)
 
-        track_pen = QPen(QColor(_HP_TRACK))
+        track_pen = QPen(QColor(_TRACK))
         track_pen.setWidth(_REVEAL_RING_STROKE)
         painter.setPen(track_pen)
         painter.drawArc(rect, 0, 360 * 16)
@@ -250,41 +240,37 @@ class BossFightView(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_battlefield(), 3)
-        root.addWidget(self._build_message_box(), 2)
+        battlefield = self._build_battlefield()
+        message_box = self._build_message_box()
+        # Ignore content size hints so the 2:1 split holds at every window size.
+        for part in (battlefield, message_box):
+            part.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        root.addWidget(battlefield, 2)
+        root.addWidget(message_box, 1)
 
-    def _build_hp_box(self, name: str) -> tuple[QFrame, QProgressBar, QLabel]:
+    def _build_charge_box(self) -> QFrame:
         box = QFrame()
-        box.setObjectName("hpBox")
+        box.setObjectName("chargeBox")
 
-        name_label = QLabel(name)
+        name_label = QLabel("Communication")
         name_label.setFont(_font(_NAME_PIXEL_SIZE, QFont.Weight.Bold))
 
-        hp_tag = QLabel("HP")
-        hp_tag.setFont(_font(_HP_TAG_PIXEL_SIZE, QFont.Weight.Bold))
+        self._charge_bar = QProgressBar()
+        self._charge_bar.setObjectName("chargeBar")
+        self._charge_bar.setTextVisible(False)
+        self._charge_bar.setFixedHeight(_CHARGE_BAR_HEIGHT)
 
-        bar = QProgressBar()
-        bar.setTextVisible(False)
-        bar.setFixedHeight(_HP_BAR_HEIGHT)
-        _style_hp_bar(bar, 1, 1)
+        self._charge_value = QLabel()
+        self._charge_value.setFont(_font(_CHARGE_VALUE_PIXEL_SIZE))
 
-        value_label = QLabel()
-        value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        value_label.setFont(_font(_HP_VALUE_PIXEL_SIZE))
-
-        bar_row = QHBoxLayout()
-        bar_row.setSpacing(6)
-        bar_row.addWidget(hp_tag)
-        bar_row.addWidget(bar, 1)
-
-        layout = QVBoxLayout(box)
+        layout = QHBoxLayout(box)
         layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(4)
+        layout.setSpacing(10)
         layout.addWidget(name_label)
-        layout.addLayout(bar_row)
-        layout.addWidget(value_label, alignment=Qt.AlignRight)
+        layout.addWidget(self._charge_bar, 1)
+        layout.addWidget(self._charge_value)
 
-        return box, bar, value_label
+        return box
 
     def _build_counter_chip(self) -> tuple[QFrame, QLabel]:
         chip = QFrame()
@@ -300,57 +286,28 @@ class BossFightView(QWidget):
         return chip, label
 
     def _build_battlefield(self) -> QFrame:
-        battlefield = QFrame()
-        battlefield.setObjectName("battlefield")
+        battlefield = _Battlefield()
 
-        self._boss_box, self._boss_hp_bar, self._boss_value = self._build_hp_box("Boss")
-        self._player_box, self._player_hp_bar, self._player_value = self._build_hp_box("You")
+        score_chip, self._score_label = self._build_counter_chip()
+        timer_chip, self._match_timer_label = self._build_counter_chip()
 
-        boss_stack = self._build_sprite_stack(
-            _BOSS_SPRITE_PATH, _BOSS_SPRITE_HEIGHT, _BOSS_PLATFORM_WIDTH, "Boss"
-        )
-        player_stack = self._build_sprite_stack(
-            _PLAYER_SPRITE_PATH, _PLAYER_SPRITE_HEIGHT, _PLAYER_PLATFORM_WIDTH, "You"
-        )
+        top_row = QHBoxLayout()
+        top_row.addWidget(score_chip)
+        top_row.addStretch(1)
+        top_row.addWidget(timer_chip)
 
-        grid = QGridLayout(battlefield)
-        grid.setContentsMargins(16, 16, 16, 16)
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(12)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 2)
-        grid.setRowStretch(0, 2)
-        grid.setRowStretch(1, 1)
-
-        # Classic crisscross: each combatant's HP window sits diagonally
-        # opposite its own sprite.
-        grid.addWidget(self._boss_box, 0, 0, alignment=Qt.AlignTop | Qt.AlignLeft)
-        grid.addLayout(boss_stack, 0, 1, alignment=Qt.AlignTop | Qt.AlignRight)
-        grid.addLayout(player_stack, 1, 0, alignment=Qt.AlignBottom | Qt.AlignLeft)
-        grid.addWidget(self._player_box, 1, 1, alignment=Qt.AlignBottom | Qt.AlignRight)
+        layout = QVBoxLayout(battlefield)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.addLayout(top_row)
+        layout.addStretch(1)
+        # 1:6:1 stretch keeps the bar at 3/4 of the width, centred.
+        charge_row = QHBoxLayout()
+        charge_row.addStretch(1)
+        charge_row.addWidget(self._build_charge_box(), 6)
+        charge_row.addStretch(1)
+        layout.addLayout(charge_row)
 
         return battlefield
-
-    def _build_sprite_stack(
-        self, path: Path, sprite_height: int, platform_width: int, fallback_text: str
-    ) -> QVBoxLayout:
-        image = QLabel()
-        image.setAlignment(Qt.AlignCenter)
-        sprite = _load_sprite(path, sprite_height)
-        if sprite.isNull():
-            image.setText(fallback_text)
-        else:
-            image.setPixmap(sprite)
-
-        platform = QFrame()
-        platform.setObjectName("platform")
-        platform.setFixedSize(platform_width, _PLATFORM_HEIGHT)
-
-        stack = QVBoxLayout()
-        stack.setSpacing(0)
-        stack.addWidget(image, alignment=Qt.AlignHCenter)
-        stack.addWidget(platform, alignment=Qt.AlignHCenter)
-        return stack
 
     def _build_message_box(self) -> QFrame:
         message_box = QFrame()
@@ -403,33 +360,24 @@ class BossFightView(QWidget):
         gesture_column.addWidget(gesture_card, alignment=Qt.AlignHCenter)
         gesture_column.addWidget(self._gesture_timer_bar, alignment=Qt.AlignHCenter)
 
-        practice_row = QHBoxLayout()
-        practice_row.setSpacing(24)
-        practice_row.addStretch(1)
-        practice_row.addWidget(self._target_label)
-        practice_row.addLayout(gesture_column)
-        practice_row.addStretch(1)
+        letter_column = QVBoxLayout()
+        letter_column.addStretch(1)
+        letter_column.addWidget(self._instruction_label, alignment=Qt.AlignHCenter)
+        letter_column.addWidget(self._target_label, alignment=Qt.AlignHCenter)
+        letter_column.addStretch(1)
 
-        score_chip, self._score_label = self._build_counter_chip()
-        timer_chip, self._match_timer_label = self._build_counter_chip()
-
-        footer_row = QHBoxLayout()
-        footer_row.addWidget(score_chip)
-        footer_row.addStretch(1)
-        footer_row.addWidget(timer_chip)
-
-        layout = QVBoxLayout(message_box)
-        layout.setContentsMargins(20, 16, 20, 12)
-        layout.setSpacing(14)
-        layout.addWidget(self._instruction_label)
-        layout.addLayout(practice_row)
+        layout = QHBoxLayout(message_box)
+        layout.setContentsMargins(20, 12, 20, 12)
+        layout.setSpacing(24)
         layout.addStretch(1)
-        layout.addLayout(footer_row)
+        layout.addLayout(letter_column)
+        layout.addLayout(gesture_column)
+        layout.addStretch(1)
 
         return message_box
 
     def resizeEvent(self, event) -> None:
-        self._apply_scale(_scale_for_width(self.width()))
+        self._apply_scale(_scale_for_size(self.width(), self.height()))
         super().resizeEvent(event)
 
     def _apply_scale(self, scale: float) -> None:
@@ -459,17 +407,9 @@ class BossFightView(QWidget):
         runtime: BossFightRuntimeState,
         player: PlayerGameState,
     ) -> None:
-        player_hp = max(0, runtime.player_hp)
-        self._player_hp_bar.setMaximum(runtime.player_max_hp)
-        self._player_hp_bar.setValue(player_hp)
-        _style_hp_bar(self._player_hp_bar, player_hp, runtime.player_max_hp)
-        self._player_value.setText(f"{player_hp}/{runtime.player_max_hp}")
-
-        boss_hp = max(0, runtime.boss_hp)
-        self._boss_hp_bar.setMaximum(runtime.boss_max_hp)
-        self._boss_hp_bar.setValue(boss_hp)
-        _style_hp_bar(self._boss_hp_bar, boss_hp, runtime.boss_max_hp)
-        self._boss_value.setText(f"{boss_hp}/{runtime.boss_max_hp}")
+        self._charge_bar.setMaximum(runtime.charge_max)
+        self._charge_bar.setValue(runtime.charge)
+        self._charge_value.setText(f"{runtime.charge}/{runtime.charge_max}")
 
         self._target_label.setText(runtime.current_target_letter)
 

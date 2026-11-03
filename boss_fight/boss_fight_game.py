@@ -53,10 +53,8 @@ class BossFightGame(BaseGame):
         self._config = config
         self._player_id = next(iter(context.player_camera_mapping))
         self._runtime = BossFightRuntimeState(
-            boss_hp=config.boss_max_hp,
-            boss_max_hp=config.boss_max_hp,
-            player_hp=config.player_max_hp,
-            player_max_hp=config.player_max_hp,
+            charge=0,
+            charge_max=config.charge_max,
             time_remaining=config.match_time_seconds,
             gesture_time_remaining=config.gesture_time_limit_seconds,
             current_target_letter=self._letter_provider(),
@@ -84,8 +82,12 @@ class BossFightGame(BaseGame):
     def _on_gesture(self, event: GestureRecognitionEvent) -> None:
         assert self._runtime is not None
         sign = event.recognized_sign.strip().upper()
-        if len(sign) == 1 and sign.isalpha() and sign == self._runtime.current_target_letter:
+        if len(sign) != 1 or not sign.isalpha():
+            return
+        if sign == self._runtime.current_target_letter:
             self._on_hit(event)
+        else:
+            self._on_wrong(event)
 
     # ----- game-specific accessors -----
 
@@ -108,17 +110,12 @@ class BossFightGame(BaseGame):
     def _collect_metadata(self) -> Mapping[str, Any]:
         assert self._runtime is not None and self._player_id is not None
         player = self.get_player_state(self._player_id)
-        if self._runtime.boss_hp <= 0:
-            outcome = "win"
-        elif not player.is_active:
-            outcome = "loss"
-        else:
-            outcome = "timeout"
+        outcome = "win" if self._runtime.charge >= self._runtime.charge_max else "timeout"
         return MappingProxyType(
             {
                 "outcome": outcome,
-                "boss_hp": self._runtime.boss_hp,
-                "boss_max_hp": self._runtime.boss_max_hp,
+                "charge": self._runtime.charge,
+                "charge_max": self._runtime.charge_max,
                 "hits": player.current_step,
                 "misses": player.mistakes,
             }
@@ -131,7 +128,7 @@ class BossFightGame(BaseGame):
             self._runtime is not None and self._config is not None and self._player_id is not None
         )
         player = self.get_player_state(self._player_id)
-        boss_hp = self._runtime.boss_hp - self._config.damage_per_hit
+        charge = min(self._runtime.charge_max, self._runtime.charge + self._config.charge_per_hit)
         self._update_player(
             self._player_id,
             score=player.score + self._config.points_per_hit,
@@ -150,12 +147,33 @@ class BossFightGame(BaseGame):
                 ),
             )
         )
-        if boss_hp <= 0:
-            self._runtime = replace(self._runtime, boss_hp=0)
+        self._runtime = replace(self._runtime, charge=charge)
+        if charge >= self._runtime.charge_max:
             self.end(GameEndReason.COMPLETED)
             return
-        self._runtime = replace(self._runtime, boss_hp=boss_hp)
         self._next_target()
+
+    def _on_wrong(self, event: GestureRecognitionEvent) -> None:
+        """A wrong letter drains charge; the target stays so the player can retry."""
+        assert (
+            self._runtime is not None and self._config is not None and self._player_id is not None
+        )
+        player = self.get_player_state(self._player_id)
+        self._update_player(self._player_id, mistakes=player.mistakes + 1)
+        self._runtime = replace(self._runtime, charge=self._drained_charge())
+        self._sink.on_action_ready(
+            GameActionEvent(
+                session_id=event.session_id,
+                game_id=self.GAME_ID,
+                player_id=self._player_id,
+                action_type="wrong",
+                is_success=False,
+                points_delta=0,
+                metadata=MappingProxyType(
+                    {"sign": event.recognized_sign, "confidence": event.confidence}
+                ),
+            )
+        )
 
     def _on_miss(self) -> None:
         assert (
@@ -163,24 +181,16 @@ class BossFightGame(BaseGame):
         )
         assert self._context is not None
         player = self.get_player_state(self._player_id)
-        new_player_hp = max(0, self._runtime.player_hp - self._config.player_damage_per_miss)
         self._update_player(
             self._player_id,
             score=max(0, player.score - self._config.score_penalty_points),
             mistakes=player.mistakes + 1,
-            is_active=new_player_hp > 0,
         )
         self._runtime = replace(
             self._runtime,
-            player_hp=new_player_hp,
+            charge=self._drained_charge(),
             time_remaining=max(
                 0.0, self._runtime.time_remaining - self._config.time_penalty_seconds
-            ),
-            # Strengthens the boss's current HP only, capped at boss_max_hp — boss_max_hp
-            # itself does not grow (fixes a divergence from the original blueprint, where
-            # an earlier implementation grew boss_max_hp on every miss too).
-            boss_hp=min(
-                self._runtime.boss_max_hp, self._runtime.boss_hp + self._config.boss_strengthen_hp
             ),
         )
         self._sink.on_action_ready(
@@ -194,10 +204,11 @@ class BossFightGame(BaseGame):
                 metadata=MappingProxyType({}),
             )
         )
-        if new_player_hp <= 0:
-            self.end(GameEndReason.COMPLETED)
-            return
         self._next_target()
+
+    def _drained_charge(self) -> int:
+        assert self._runtime is not None and self._config is not None
+        return max(0, self._runtime.charge - self._config.charge_loss_per_miss)
 
     def _next_target(self) -> None:
         assert self._runtime is not None and self._config is not None

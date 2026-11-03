@@ -122,12 +122,14 @@ Each minigame is a top-level package containing:
 
 `boss_fight` specifically: the match timer and per-gesture timer both count down via
 `update_frame(delta_ms)`, driven externally by `dev_harness.py`'s 10 Hz `QTimer`. A
-matching `GestureRecognitionEvent` damages the boss and picks a new target letter; the
-per-gesture timer expiring counts as a miss, which damages the player, penalizes score
-and match time, and strengthens the boss's current HP (capped at `boss_max_hp`, which
-itself does not grow). The gesture's reference image is intentionally hidden until
-`gesture_image_reveal_percentage` of the per-gesture timer has elapsed, to force the
-player to attempt the gesture from memory first.
+matching `GestureRecognitionEvent` fills the communication bar (`charge`, starts at 0;
+full = win) and picks a new target letter. A wrong letter drains `charge_loss_per_miss`
+but keeps the same target so the player can retry. The per-gesture timer expiring is a
+miss: it drains the same amount, penalizes score and match time, and picks a new letter.
+There is no player HP — the only other ending is the match clock running out. The
+gesture's reference image is intentionally hidden until `gesture_image_reveal_percentage`
+of the per-gesture timer has elapsed, to force the player to attempt the gesture from
+memory first.
 
 ### Adding a new minigame
 
